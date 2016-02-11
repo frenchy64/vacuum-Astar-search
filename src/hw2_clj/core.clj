@@ -19,24 +19,41 @@
 ;     :parent (Nilable Node)
 ;     :pos '{:x Int :y Int}
 ;     :cost Int
-;     :dimensions '{:x Int :y Int}})
+;     :dimensions '{:x Int :y Int}
+;     :stats (Atom '{:search-cost Int
+;                    :max-branching Int})})
 
 ; [-> Node]
-(defn init-map []
-  (let [s (vec
-            (for [i (range 3)]
-              (vec
-                (for [j (range 3)]
-                  {:x i
-                   :y j
-                   :has-dirt? (= 2 j)
-                   :has-vacuum? (= 1 i j)}))))]
-    {:state s
-     :parent nil
-     :pos {:x 1 :y 1}
-     :move nil
-     :cost 0
-     :dimensions {:x 3 :y 3}}))
+(defn init-map 
+  "An initial node with a 3x3 grid. Dirt is on the top row.
+  Vacuum starts in the centre."
+  ([] 
+   ;; default to 3x3 grid
+   (init-map 3 3))
+  ([x y]
+   ;; dirt on just top row
+   (init-map x y
+             (fn [i j]
+               (= (inc j) y))))
+  ([x y dirt-fn]
+   (let [vacuum-pos {:x (int (/ x 2)) 
+                     :y (int (/ y 2))}
+         s (vec
+             (for [i (range x)]
+               (vec
+                 (for [j (range y)]
+                   {:x i
+                    :y j
+                    :has-dirt? (dirt-fn i j)
+                    :has-vacuum? (= vacuum-pos {:x i :y j})}))))]
+     {:state s
+      :parent nil
+      :pos vacuum-pos
+      :move nil
+      :cost 0
+      :dimensions {:x x :y y}
+      :stats (atom {:search-cost 0
+                    :max-branching 0})})))
 
 ; [Node -> Bool]
 (defn goal-state?
@@ -51,7 +68,8 @@
 
 ; [Node Move -> (Nilable Node)]
 (defn apply-move
-  "Returns nil if this is an illegal move, otherwise applies the move."
+  "Returns nil if this is an illegal move, otherwise applies the move.
+  Only sucks when there is dirt."
   [{:keys [pos state dimensions] :as g} move]
   (letfn [(update-common [m]
             (-> m
@@ -59,9 +77,10 @@
                 (update :cost inc)
                 (assoc :move move)))]
     (case move
-      (:suck) (-> g
-                  update-common
-                  (assoc-in [:state (:x pos) (:y pos) :has-dirt?] false))
+      (:suck) (when (get-in g [:state (:x pos) (:y pos) :has-dirt?])
+                (-> g
+                    update-common
+                    (assoc-in [:state (:x pos) (:y pos) :has-dirt?] false)))
 
       ;; else
       (let [[in-boundary? x-move y-move]
@@ -119,13 +138,14 @@
 (defn pmap-extend-frontier [frontier states]
   (letfn [(calc-priority [s]
             {:pre [(map? s)]}
-            (apply + (map (fn [row]
-                            (apply + (map (fn [{:keys [has-dirt?] :as m}]
-                                            (assert (contains? m :has-dirt?)
-                                                    (str m row))
-                                            (if has-dirt? 1 0))
-                                          row)))
-                          (:state s))))]
+            (+ (:cost s)
+               (apply + (map (fn [row]
+                               (apply + (map (fn [{:keys [has-dirt?] :as m}]
+                                               (assert (contains? m :has-dirt?)
+                                                       (str m row))
+                                               (if has-dirt? 1 0))
+                                             row)))
+                             (:state s)))))]
     (into frontier (map (fn [s]
                           [s (calc-priority s)])
                         states))))
@@ -183,27 +203,39 @@
           node
           (let [explored (remember-explored explored node)
                 ;; keep only legal moves we have not already explored
-                frontier (extend-frontier
-                           frontier
-                           (keep (fn [move]
+                new-states (keep (fn [move]
                                    (let [n (apply-move node move)]
                                      (when (and n
                                                 (not (already-explored? explored n)))
                                        n)))
-                                 moves))]
+                                 moves)
+                _ (swap! (:stats node) update :max-branching max (count new-states))
+                frontier (extend-frontier
+                           frontier
+                           new-states)]
+            (swap! (:stats node) update :search-cost inc)
             (recur frontier explored)))))))
 
 (defn determine-cost [config init]
   (:cost (search-common config init)))
 
-(defn determine-path [config init]
+(defn determine-path* [r]
   (loop [path '()
-         r (search-common config init)]
+         r r]
     (when r
       (if-let [move (:move r)]
         (recur (conj path move)
                (:parent r))
         path))))
+
+(defn determine-path [config init]
+  (determine-path* (search-common config init)))
+
+(defn search-stats [config init]
+  (let [r (search-common config init)]
+    (merge @(:stats r)
+           (select-keys r [:cost])
+           {:path (determine-path* r)})))
 
 ;(search-bfs (init-map))
 (determine-cost (priority-map-frontier-config) (init-map))
@@ -211,3 +243,74 @@
 
 (determine-cost (vector-frontier-config) (init-map))
 (determine-path (vector-frontier-config) (init-map))
+
+(search-stats (priority-map-frontier-config) (init-map))
+(search-stats (vector-frontier-config) (init-map))
+
+#_(search-stats (vector-frontier-config) (init-map 3 3
+                                                 (fn [_ _]
+                                                   (< 0.2 (rand)))))
+
+;; Reflex agent that sucks if dirt
+(search-stats (vector-frontier-config) (init-map 3 3
+                                                 (fn [_ _]
+                                                   (< 0.2 (rand)))))
+;{:search-cost 43922, :max-branching 5, :cost 14, 
+; :path (:suck :up :suck :left :suck :down :down :suck :right :suck :right :suck :up :suck)}
+
+;; A* search agent
+(search-stats (priority-map-frontier-config) (init-map 3 3
+                                                 (fn [_ _]
+                                                   (< 0.2 (rand)))))
+;{:search-cost 4019, :max-branching 5, :cost 14, 
+; :path (:suck :down :suck :right :suck :up :suck :left :up :suck :left :suck :down :suck)}
+
+#_
+(dotimes [_ 5]
+  (time
+    (prn 
+      (search-stats (priority-map-frontier-config) (init-map 3 3
+                                                             (fn [_ _]
+                                                               (< 0.2 (rand))))))))
+;{:search-cost 4533, :max-branching 5, :cost 14, :path (:suck :up :suck :right :suck :down :suck :down :suck :left :left :suck :up :suck)}
+;"Elapsed time: 612.120436 msecs"
+;{:search-cost 8524, :max-branching 5, :cost 16, :path (:suck :down :suck :right :suck :up :up :suck :left :suck :left :suck :down :suck :down :suck)}
+;"Elapsed time: 1390.728742 msecs"
+;{:search-cost 5018, :max-branching 5, :cost 14, :path (:suck :down :suck :right :suck :up :suck :up :suck :left :left :suck :down :suck)}
+;"Elapsed time: 720.46617 msecs"
+;{:search-cost 15451, :max-branching 5, :cost 17, :path (:suck :left :suck :up :suck :right :suck :right :suck :down :suck :down :suck :left :suck :left :suck)}
+;"Elapsed time: 2560.01815 msecs"
+;{:search-cost 12240, :max-branching 5, :cost 16, :path (:suck :right :suck :up :suck :left :suck :left :suck :down :down :suck :right :suck :right :suck)}
+;"Elapsed time: 1863.027061 msecs"
+
+;(search-stats (vector-frontier-config) (init-map 20 20))
+
+(do
+  ;; reflex
+  (time
+    (prn
+    (search-stats (vector-frontier-config) (init-map 3 3))))
+  ;; A*
+  (time
+    (prn
+      (search-stats (priority-map-frontier-config) (init-map 3 3)))))
+;{:search-cost 220, :max-branching 4, :cost 7, :path (:up :right :suck :left :suck :left :suck)}
+;"Elapsed time: 15.037175 msecs"
+;{:search-cost 78, :max-branching 4, :cost 7, :path (:up :right :suck :left :suck :left :suck)}
+;"Elapsed time: 14.849776 msecs"
+
+(do
+  ;; reflex
+  (time
+    (prn
+    (search-stats (vector-frontier-config) (init-map 5 5))))
+  ;; A*
+  (time
+    (prn
+      (search-stats (priority-map-frontier-config) (init-map 5 5)))))
+;{:search-cost 17238, :max-branching 4, :cost 13, 
+; :path (:up :up :right :right :suck :left :suck :left :suck :left :suck :left :suck)}
+;"Elapsed time: 5711.926171 msecs"
+;{:search-cost 1588, :max-branching 4, :cost 13, 
+; :path (:up :up :suck :left :suck :left :suck :right :right :right :suck :right :suck)}
+;"Elapsed time: 208.511224 msecs"
